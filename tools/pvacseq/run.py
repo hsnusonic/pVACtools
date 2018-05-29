@@ -46,7 +46,7 @@ def main(args_input = sys.argv[1:]):
     else:
         sys.exit("The downstream sequence length needs to be a positive integer or 'full'")
 
-    input_file_type = 'vcf'
+    input_file_type = args.input_file_type or 'vcf'
     base_output_dir = os.path.abspath(args.output_dir)
 
     class_i_prediction_algorithms = []
@@ -122,7 +122,10 @@ def main(args_input = sys.argv[1:]):
         class_i_arguments['prediction_algorithms']   = class_i_prediction_algorithms
         class_i_arguments['output_dir']              = output_dir
         class_i_arguments['netmhc_stab']             = args.netmhc_stab
-        pipeline = MHCIPipeline(**class_i_arguments)
+        if args.input_file_type == "fasta":
+            pipeline = FastaPipeline(**class_i_arguments)
+        else:
+            pipeline = MHCIPipeline(**class_i_arguments)
         pipeline.execute()
     elif len(class_i_prediction_algorithms) == 0:
         print("No MHC class I prediction algorithms chosen. Skipping MHC class I predictions.")

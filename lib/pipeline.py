@@ -19,6 +19,7 @@ from lib.filter import *
 import shutil
 import yaml
 import pkg_resources
+from Bio import SeqIO
 
 def status_message(msg):
     print(msg)
@@ -136,6 +137,7 @@ class Pipeline(metaclass=ABCMeta):
             'vcf'  : 'DefaultOutputParser',
             'bedpe': 'FusionOutputParser',
             'pvacvector_input_fasta': 'VectorOutputParser',
+            'fasta': 'CustomOutputParser',
         }
         parser_type = parser_types[self.input_file_type]
         parser = getattr(sys.modules[__name__], parser_type)
@@ -576,7 +578,7 @@ class MHCIIPipeline(Pipeline):
                         a,
                         '-r', str(self.iedb_retries),
                         '-e', self.iedb_executable,
-                    ])
+                     ])
                     last_execute_timestamp = datetime.datetime.now()
                     status_message("Completed")
                     split_iedb_output_files.append(split_iedb_out)
@@ -607,3 +609,221 @@ class MHCIIPipeline(Pipeline):
                     split_parsed_output_files.append(split_parsed_file_path)
 
         return split_parsed_output_files
+
+class FastaPipeline(Pipeline):
+    def __init__(self, **kwargs):
+        Pipeline.__init__(self, **kwargs)
+        self.peptide_sequence_length = kwargs.pop('peptide_sequence_length', 21)
+        self.epitope_lengths         = kwargs['epitope_lengths']
+
+    def generate_fasta(self, chunks):
+        pass
+
+    def fasta_entry_count(self):
+        with open(self.input_file, 'r') as fasta_file:
+            row_count = 0
+            for header in fasta_file:
+                seq = fasta_file.readline()
+                if header.startswith(">"):
+                    row_count += 1
+        return row_count
+
+    def split_fasta_file(self, total_entry_count):
+        status_message("Splitting Fasta into smaller chunks")
+        fasta_size = self.fasta_size
+        chunks = []
+        entry_count = 1
+        split_count = 1
+        split_start = entry_count
+        split_end = split_start + fasta_size - 1
+        if split_end > total_entry_count:
+            split_end = total_entry_count
+        status_message("Splitting Fasta into smaller chunks - Entries %d-%d" % (split_start, split_end))
+        split_fasta_file_path = "%s_%d-%d" % (self.split_fasta_basename(), split_start, split_end)
+        split_fasta_key_file_path = split_fasta_file_path + ".key"
+        chunks.append([split_start, split_end])
+        if os.path.exists(split_fasta_file_path):
+            status_message("Split Fasta file for Entries %d-%d already exists. Skipping." % (split_start, split_end))
+            skip = 1
+        else:
+            split_fasta_file = open(split_fasta_file_path, 'w')
+            split_fasta_key_file = open(split_fasta_key_file_path, 'w')
+            skip = 0
+        for record in SeqIO.parse(self.input_file, "fasta"):
+            if skip == 0:
+                split_fasta_file.write('>%s\n' % split_count)
+                split_fasta_file.write('%s\n' % record.seq)
+                yaml.dump({split_count: record.id}, split_fasta_key_file, default_flow_style=False)
+            if entry_count == total_entry_count:
+                break
+            if entry_count % fasta_size == 0:
+                if skip == 0:
+                    split_fasta_file.close()
+                    split_fasta_key_file.close()
+                split_count = 0
+                split_start = entry_count + 1
+                split_end = split_start + fasta_size - 1
+                if split_end > total_entry_count:
+                    split_end = total_entry_count
+                status_message("Splitting Fasta into smaller chunks - Entries %d-%d" % (split_start, split_end))
+                split_fasta_file_path = "%s_%d-%d" % (self.split_fasta_basename(), split_start, split_end)
+                split_fasta_key_file_path = split_fasta_file_path + ".key"
+                chunks.append([split_start, split_end])
+                if os.path.exists(split_fasta_file_path):
+                    status_message("Split Fasta file for Entries %d-%d already exists. Skipping." % (split_start, split_end))
+                    skip = 1
+                else:
+                    split_fasta_file = open(split_fasta_file_path, 'w')
+                    split_fasta_key_file = open(split_fasta_key_file_path, 'w')
+                    skip = 0
+            split_count += 1
+            entry_count += 1
+        if skip == 0:
+            split_fasta_file.close()
+            split_fasta_key_file.close()
+        status_message("Completed")
+        return chunks
+
+    def call_iedb_and_parse_outputs(self, chunks):
+        split_parsed_output_files = []
+        for (split_start, split_end) in chunks:
+            fasta_chunk = "%d-%d" % (split_start, split_end)
+            for a in self.alleles:
+                for epl in self.epitope_lengths:
+                    split_fasta_file_path = "%s_%s"%(self.split_fasta_basename(), fasta_chunk)
+                    split_iedb_output_files = []
+                    status_message("Processing entries for Allele %s and Epitope Length %s - Entries %s" % (a, epl, fasta_chunk))
+                    if os.path.getsize(split_fasta_file_path) == 0:
+                        status_message("Fasta file is empty. Skipping")
+                        continue
+                    for method in self.prediction_algorithms:
+                        prediction_class = globals()[method]
+                        prediction = prediction_class()
+                        iedb_method = prediction.iedb_prediction_method
+                        valid_alleles = prediction.valid_allele_names()
+                        if a not in valid_alleles:
+                            status_message("Allele %s not valid for Method %s. Skipping." % (a, method))
+                            continue
+                        valid_lengths = prediction.valid_lengths_for_allele(a)
+                        if epl not in valid_lengths:
+                            status_message("Epitope Length %s is not valid for Method %s and Allele %s. Skipping." % (epl, method, a))
+                            continue
+
+                        split_iedb_out = os.path.join(self.tmp_dir, ".".join([self.sample_name, iedb_method, a, str(epl), "fasta_%s" % fasta_chunk]))
+                        if os.path.exists(split_iedb_out):
+                            status_message("IEDB file for Allele %s and Epitope Length %s with Method %s (Entries %s) already exists. Skipping." % (a, epl, method, fasta_chunk))
+                            split_iedb_output_files.append(split_iedb_out)
+                            continue
+                        status_message("Running IEDB on Allele %s and Epitope Length %s with Method %s - Entries %s" % (a, epl, method, fasta_chunk))
+
+                        if not os.environ.get('TEST_FLAG') or os.environ.get('TEST_FLAG') == '0':
+                            if 'last_execute_timestamp' in locals() and not self.iedb_executable:
+                                elapsed_time = ( datetime.datetime.now() - last_execute_timestamp ).total_seconds()
+                                wait_time = 60 - elapsed_time
+                                if wait_time > 0:
+                                    time.sleep(wait_time)
+
+                        lib.call_iedb.main([
+                            split_fasta_file_path,
+                            split_iedb_out,
+                            iedb_method,
+                            a,
+                            '-l', str(epl),
+                            '-r', str(self.iedb_retries),
+                            '-e', self.iedb_executable,
+                        ])
+                        last_execute_timestamp = datetime.datetime.now()
+                        status_message("Completed")
+                        split_iedb_output_files.append(split_iedb_out)
+
+                    split_parsed_file_path = os.path.join(self.tmp_dir, ".".join([self.sample_name, a, str(epl), "parsed", "tsv_%s" % fasta_chunk]))
+                    if os.path.exists(split_parsed_file_path):
+                        status_message("Parsed Output File for Allele %s and Epitope Length %s (Entries %s) already exists. Skipping" % (a, epl, fasta_chunk))
+                        split_parsed_output_files.append(split_parsed_file_path)
+                        continue
+                    split_fasta_key_file_path = split_fasta_file_path + '.key'
+
+                    if len(split_iedb_output_files) > 0:
+                        status_message("Parsing IEDB Output for Allele %s and Epitope Length %s - Entries %s" % (a, epl, fasta_chunk))
+                        params = {
+                            'input_iedb_files'       : split_iedb_output_files,
+                            'key_file'               : split_fasta_key_file_path,
+                            'output_file'            : split_parsed_file_path,
+                        }
+                        if self.additional_report_columns and 'sample_name' in self.additional_report_columns:
+                            params['sample_name'] = self.sample_name
+                        else:
+                            params['sample_name'] = None
+                        parser = self.output_parser(params)
+                        parser.execute()
+                        status_message("Completed")
+                        split_parsed_output_files.append(split_parsed_file_path)
+        return split_parsed_output_files
+
+    def combined_parsed_outputs(self, split_parsed_output_files):
+        status_message("Combining Parsed IEDB Output Files")
+        lib.combine_parsed_outputs.fasta([
+            *split_parsed_output_files,
+            self.combined_parsed_path(),
+        ])
+        status_message("Completed")
+
+    def execute(self):
+        self.print_log()
+
+        total_entry_count = self.fasta_entry_count()
+        if total_entry_count == 0:
+            sys.exit("The Fasta file is empty or corrupted.")
+        chunks = self.split_fasta_file(total_entry_count)
+
+        split_parsed_output_files = self.call_iedb_and_parse_outputs(chunks)
+
+        if len(split_parsed_output_files) == 0:
+            status_message("No output files were created. Aborting.")
+            return
+
+        self.combined_parsed_outputs(split_parsed_output_files)
+        #self.binding_filter()
+
+        symlinks_to_delete = []
+        if (self.gene_expn_file is not None
+            or self.transcript_expn_file is not None
+            or self.normal_snvs_coverage_file is not None
+            or self.normal_indels_coverage_file is not None
+            or self.tdna_snvs_coverage_file is not None
+            or self.tdna_indels_coverage_file is not None
+            or self.trna_snvs_coverage_file is not None
+            or self.trna_indels_coverage_file is not None):
+            self.coverage_filter()
+        else:
+            os.symlink(self.binding_filter_out_path(), self.coverage_filter_out_path())
+            symlinks_to_delete.append(self.coverage_filter_out_path())
+
+        if self.top_result_per_mutation:
+            self.top_result_filter()
+        else:
+            os.symlink(self.coverage_filter_out_path(), self.top_result_filter_out_path())
+            symlinks_to_delete.append(self.top_result_filter_out_path())
+
+        if self.net_chop_method:
+            self.net_chop()
+        else:
+            os.symlink(self.top_result_filter_out_path(), self.net_chop_out_path())
+            symlinks_to_delete.append(self.net_chop_out_path())
+
+        if self.netmhc_stab:
+            self.call_netmhc_stab()
+        else:
+            os.symlink(self.net_chop_out_path(), self.netmhc_stab_out_path())
+            symlinks_to_delete.append(self.netmhc_stab_out_path())
+
+        for symlink in symlinks_to_delete:
+            os.unlink(symlink)
+
+
+        status_message(
+            "\n"
+            + "Done: Pipeline finished successfully. File %s contains list of filtered putative neoantigens. " % self.final_path()
+        )
+        if self.keep_tmp_files is False:
+            shutil.rmtree(self.tmp_dir)

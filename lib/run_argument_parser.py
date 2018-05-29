@@ -12,6 +12,10 @@ class RunArgumentParser(metaclass=ABCMeta):
             help=input_file_help
         )
         parser.add_argument(
+            "--input-file-type",
+            help="Specify the type of input file."
+        )
+        parser.add_argument(
             "sample_name",
             help="The name of the sample being processed. This will be used as a prefix for output files"
         )
