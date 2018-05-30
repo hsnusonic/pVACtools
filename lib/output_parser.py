@@ -697,7 +697,7 @@ class CustomOutputParser(OutputParser):
                         position   = line['start']
                     epitope        = line['peptide']
                     score          = line['ic50']
-                    rank           = line['percentile_rank']
+                    rank           = line['rank']
                     allele         = line['allele']
                     peptide_length = len(epitope)
 
